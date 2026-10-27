@@ -18,18 +18,40 @@
 package org.apache.kyuubi.plugin.spark.authz.ranger
 
 import scala.collection.JavaConverters._
+import scala.collection.concurrent.TrieMap
 import scala.collection.mutable.{ArrayBuffer, LinkedHashMap}
 
+import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.util.ShutdownHookManager
-import org.apache.ranger.plugin.policyengine.RangerAccessRequest
+import org.apache.ranger.plugin.model.RangerServiceDef
+import org.apache.ranger.plugin.policyengine.{RangerAccessRequest, RangerAccessResult}
 import org.apache.ranger.plugin.service.RangerBasePlugin
 import org.slf4j.LoggerFactory
 
 import org.apache.kyuubi.plugin.spark.authz.AccessControlException
+import org.apache.kyuubi.plugin.spark.authz.util.AuthZUtils.isRanger21orGreater
 
-object SparkRangerAdminPlugin extends RangerBasePlugin("spark", "sparkSql")
-  with RangerConfigProvider {
+object SparkRangerAdminPlugin {
   final private val LOG = LoggerFactory.getLogger(getClass)
+
+  final val serviceType: String = "spark"
+  final val defaultAppId: String = "sparkSql"
+  final val defaultCatalog: String = "spark_catalog"
+
+  private lazy val defaultBasePlugin: RangerBasePlugin =
+    initRangerBasePlugin(serviceName = null, appId = defaultAppId)
+
+  private val catalog2pluginMap = TrieMap.empty[String, RangerBasePlugin]
+
+  def getServiceType: String = serviceType
+
+  def getServiceDef: RangerServiceDef = getOrCreate().getServiceDef
+
+  /** plugin config of the default Ranger plugin */
+  def getRangerConf: Configuration = RangerConfigProvider.getRangerConf(defaultBasePlugin)
+
+  def isAccessAllowed(request: AccessRequest): RangerAccessResult =
+    getOrCreate(request.getResourceCatalog).isAccessAllowed(request)
 
   /**
    * For a Spark SQL query, it may contain 0 or more privilege objects to verify, e.g. a typical
@@ -39,7 +61,7 @@ object SparkRangerAdminPlugin extends RangerBasePlugin("spark", "sparkSql")
    * to verify them one by one.
    */
   def authorizeInSingleCall: Boolean = getRangerConf.getBoolean(
-    s"ranger.plugin.${getServiceType}.authorize.in.single.call",
+    s"ranger.plugin.$serviceType.authorize.in.single.call",
     false)
 
   /**
@@ -57,16 +79,59 @@ object SparkRangerAdminPlugin extends RangerBasePlugin("spark", "sparkSql")
    * 3. at least one condition of policies containing scripts, e.g. {{USER.attr}} in row-filter
    */
   def useUserGroupsFromUserStoreEnabled: Boolean = getRangerConf.getBoolean(
-    s"ranger.plugin.$getServiceType.use.usergroups.from.userstore.enabled",
+    s"ranger.plugin.$serviceType.use.usergroups.from.userstore.enabled",
     false)
 
   /**
-   * plugin initialization
+   * plugin initialization of the default Ranger plugin
    * with cleanup shutdown hook registered
    */
   def initialize(): Unit = {
-    this.init()
-    registerCleanupShutdownHook(this)
+    defaultBasePlugin
+  }
+
+  /**
+   * Get or create the Ranger plugin for the catalog name.
+   * Falls back to the default plugin for None or `spark_catalog`,
+   * or when `ranger.plugin.spark.catalog.<catalog>.service.name` is not configured.
+   */
+  def getOrCreate(catalog: Option[String] = None): RangerBasePlugin = {
+    catalog match {
+      case None | Some(`defaultCatalog`) => defaultBasePlugin
+      case Some(catalogName) =>
+        val serviceName =
+          getRangerConf.get(s"ranger.plugin.$serviceType.catalog.$catalogName.service.name")
+        if (serviceName == null || serviceName.trim.isEmpty) {
+          defaultBasePlugin
+        } else {
+          catalog2pluginMap.getOrElseUpdate(
+            catalogName,
+            synchronized {
+              catalog2pluginMap.getOrElse(
+                catalogName,
+                initRangerBasePlugin(serviceName = serviceName, appId = catalogName))
+            })
+        }
+    }
+  }
+
+  private def initRangerBasePlugin(serviceName: String, appId: String): RangerBasePlugin = {
+    val plugin =
+      if (isRanger21orGreater) {
+        classOf[RangerBasePlugin]
+          .getConstructor(classOf[String], classOf[String], classOf[String])
+          .newInstance(serviceType, serviceName, appId)
+      } else {
+        // Ranger 2.0 and below does not support different service names with the same
+        // service type, fallback to the service name in ranger config of the service type
+        classOf[RangerBasePlugin]
+          .getConstructor(classOf[String], classOf[String])
+          .newInstance(serviceType, appId)
+      }
+    plugin.init()
+    registerCleanupShutdownHook(plugin)
+    LOG.info(s"initialized ranger plugin, serviceName: ${plugin.getServiceName}, appId: $appId")
+    plugin
   }
 
   /**
@@ -85,7 +150,7 @@ object SparkRangerAdminPlugin extends RangerBasePlugin("spark", "sparkSql")
   }
 
   def getFilterExpr(req: AccessRequest): Option[String] = {
-    val result = evalRowFilterPolicies(req, null)
+    val result = getOrCreate(req.getResourceCatalog).evalRowFilterPolicies(req, null)
     Option(result)
       .filter(_.isRowFilterEnabled)
       .map(_.getFilterExpr)
@@ -94,7 +159,7 @@ object SparkRangerAdminPlugin extends RangerBasePlugin("spark", "sparkSql")
 
   def getMaskingExpr(req: AccessRequest): Option[String] = {
     val col = req.getResource.asInstanceOf[AccessResource].getColumn
-    val result = evalDataMaskPolicies(req, null)
+    val result = getOrCreate(req.getResourceCatalog).evalDataMaskPolicies(req, null)
     Option(result).filter(_.isMaskEnabled).map { res =>
       if ("MASK_NULL".equalsIgnoreCase(res.getMaskType)) {
         "NULL"
@@ -145,29 +210,42 @@ object SparkRangerAdminPlugin extends RangerBasePlugin("spark", "sparkSql")
       requests: Seq[RangerAccessRequest],
       auditHandler: SparkRangerAuditHandler): Unit = {
     if (requests.nonEmpty) {
-      val results = SparkRangerAdminPlugin.isAccessAllowed(requests.asJava, auditHandler)
-      if (results != null) {
-        val indices = results.asScala.zipWithIndex.filter { case (result, idx) =>
-          result != null && !result.getIsAllowed
-        }.map(_._2)
-        if (indices.nonEmpty) {
-          val user = requests.head.getUser
-          val accessTypeToResource =
-            indices.foldLeft(LinkedHashMap.empty[String, ArrayBuffer[String]])((m, idx) => {
-              val req = requests(idx)
-              val accessType = req.getAccessType
-              val resource = req.getResource.getAsString
-              m.getOrElseUpdate(accessType, ArrayBuffer.empty[String])
-                .append(resource)
-              m
-            })
-          val errorMsg = accessTypeToResource
-            .map { case (accessType, resources) =>
-              s"[$accessType] ${resources.mkString("privilege on [", ",", "]")}"
-            }.mkString(", ")
-          throw new AccessControlException(
-            s"Permission denied: user [$user] does not have $errorMsg")
+      // group requests by the Ranger plugin of their catalogs,
+      // and keep the original index to report denied resources in order
+      val indices = requests.zipWithIndex
+        .groupBy {
+          case (req: AccessRequest, _) => getOrCreate(req.getResourceCatalog)
+          case _ => getOrCreate()
         }
+        .toSeq
+        .flatMap { case (plugin, reqsWithIdx) =>
+          val results = plugin.isAccessAllowed(reqsWithIdx.map(_._1).asJava, auditHandler)
+          if (results == null) {
+            Nil
+          } else {
+            reqsWithIdx.map(_._2).zip(results.asScala).collect {
+              case (idx, result) if result != null && !result.getIsAllowed => idx
+            }
+          }
+        }
+        .sorted
+      if (indices.nonEmpty) {
+        val user = requests.head.getUser
+        val accessTypeToResource =
+          indices.foldLeft(LinkedHashMap.empty[String, ArrayBuffer[String]])((m, idx) => {
+            val req = requests(idx)
+            val accessType = req.getAccessType
+            val resource = req.getResource.getAsString
+            m.getOrElseUpdate(accessType, ArrayBuffer.empty[String])
+              .append(resource)
+            m
+          })
+        val errorMsg = accessTypeToResource
+          .map { case (accessType, resources) =>
+            s"[$accessType] ${resources.mkString("privilege on [", ",", "]")}"
+          }.mkString(", ")
+        throw new AccessControlException(
+          s"Permission denied: user [$user] does not have $errorMsg")
       }
     }
   }

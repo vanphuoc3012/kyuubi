@@ -59,11 +59,22 @@ class PolicyJsonFileGenerator extends KyuubiFunSuite {
     .build()
 
   test("check ranger policy file") {
-    val policyFileName = "sparkSql_hive_jenkins.json"
+    checkPolicyFile(
+      "sparkSql_hive_jenkins.json",
+      servicePolicies("hive_jenkins", serviceId = 1, genPolicies))
+  }
+
+  test("check ranger policy file for catalog2") {
+    checkPolicyFile(
+      "sparkSql_hive_jenkins_catalog2.json",
+      servicePolicies(catalog2ServiceName, serviceId = 2, genCatalog2Policies))
+  }
+
+  private def checkPolicyFile(policyFileName: String, policies: JsonNode): Unit = {
     val policyFilePath = Paths.get(
       s"${getCurrentModuleHome(this)}/src/test/resources/$policyFileName")
     val generatedStr = mapper.writerWithDefaultPrettyPrinter()
-      .writeValueAsString(servicePolicies)
+      .writeValueAsString(policies)
 
     if (sys.env.get("KYUUBI_UPDATE").contains("1")) {
       // scalastyle:off println
@@ -83,13 +94,17 @@ class PolicyJsonFileGenerator extends KyuubiFunSuite {
     }
   }
 
-  private def servicePolicies: JsonNode = {
+  private def servicePolicies(
+      serviceName: String,
+      serviceId: Int,
+      policies: Iterable[RangerPolicy]): JsonNode = {
     val inputStream = Thread.currentThread().getContextClassLoader
       .getResourceAsStream("policies_base.json")
     val rootObjNode = mapper.readTree(inputStream).asInstanceOf[ObjectNode]
-    val policies = genPolicies
+    rootObjNode.put("serviceName", serviceName)
+    rootObjNode.put("serviceId", serviceId)
     // scalastyle:off println
-    println(s"Generated ${policies.size} policies.")
+    println(s"Generated ${policies.size} policies for service $serviceName.")
     // scalastyle:on println
     rootObjNode.set("policies", mapper.readTree(mapper.writeValueAsString(policies)))
   }
@@ -129,6 +144,30 @@ class PolicyJsonFileGenerator extends KyuubiFunSuite {
           p
       }
   }
+
+  /**
+   * Policies of the Ranger service for catalog `catalog2`,
+   * which is mapped by `ranger.plugin.spark.catalog.catalog2.service.name`
+   */
+  private def genCatalog2Policies: Iterable[RangerPolicy] = {
+    List[RangerPolicy](
+      // access for all
+      policyAccessForAllUrl.copy(service = catalog2ServiceName),
+      policyAccessForAllDbTableColumns.copy(service = catalog2ServiceName),
+      policyAccessForAllDbUdf.copy(service = catalog2ServiceName),
+      // access
+      policyAccessForCatalog2Ns1Select)
+      // fill the id and guid with auto-increased index
+      .zipWithIndex
+      .map {
+        case (p, index) =>
+          p.setId(index)
+          p.setGuid(UUID.nameUUIDFromBytes(s"$catalog2ServiceName-$index".getBytes()).toString)
+          p
+      }
+  }
+
+  private val catalog2ServiceName = "hive_jenkins_catalog2"
 
   // resources
   private val allDatabaseRes = databaseRes("*")
@@ -400,5 +439,18 @@ class PolicyJsonFileGenerator extends KyuubiFunSuite {
       KRangerPolicyItem(
         users = List(kent),
         accesses = allowTypes(select),
+        delegateAdmin = true)))
+
+  private val policyAccessForCatalog2Ns1Select = KRangerPolicy(
+    service = catalog2ServiceName,
+    name = "catalog2_ns1_select",
+    resources = Map(
+      databaseRes(namespace1),
+      allTableRes,
+      allColumnRes),
+    policyItems = List(
+      KRangerPolicyItem(
+        users = List(catalog2OnlyUser),
+        accesses = allowTypes(select, use),
         delegateAdmin = true)))
 }

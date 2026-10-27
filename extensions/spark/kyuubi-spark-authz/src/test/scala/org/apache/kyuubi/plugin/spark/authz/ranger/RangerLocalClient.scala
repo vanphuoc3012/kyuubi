@@ -21,6 +21,7 @@ import java.text.SimpleDateFormat
 
 import com.fasterxml.jackson.databind.DeserializationFeature
 import com.fasterxml.jackson.databind.json.JsonMapper
+import org.apache.hadoop.conf.Configuration
 import org.apache.ranger.admin.client.RangerAdminRESTClient
 import org.apache.ranger.plugin.util.ServicePolicies
 
@@ -30,12 +31,24 @@ class RangerLocalClient extends RangerAdminRESTClient with RangerClientHelper {
     .setDateFormat(new SimpleDateFormat("yyyyMMdd-HH:mm:ss.SSS-Z"))
     .configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false)
 
-  private val policies: ServicePolicies = {
-    val loader = Thread.currentThread().getContextClassLoader
-    val inputStream = {
-      loader.getResourceAsStream("sparkSql_hive_jenkins.json")
+  @volatile private var serviceName: String = _
+
+  // load the policy file by the service name of the Ranger plugin
+  private lazy val policies: ServicePolicies = {
+    val fileName = serviceName match {
+      case "hive_jenkins_catalog2" => "sparkSql_hive_jenkins_catalog2.json"
+      case _ => "sparkSql_hive_jenkins.json"
     }
-    mapper.readValue(inputStream, classOf[ServicePolicies])
+    val loader = Thread.currentThread().getContextClassLoader
+    mapper.readValue(loader.getResourceAsStream(fileName), classOf[ServicePolicies])
+  }
+
+  override def init(
+      serviceName: String,
+      appId: String,
+      configPropertyPrefix: String,
+      config: Configuration): Unit = {
+    this.serviceName = serviceName
   }
 
   override def getServicePoliciesIfUpdated(

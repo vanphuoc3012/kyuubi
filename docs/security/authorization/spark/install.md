@@ -104,6 +104,18 @@ By default, Authz plugin checks required privileges one by one and throw the fir
 </property>
 ```
 
+##### Using different Ranger services for multiple catalogs
+
+By default, privileges of all catalogs are checked with the policies of the Ranger service configured by `ranger.plugin.spark.service.name`. By setting `ranger.plugin.spark.catalog.<catalog>.service.name`, privileges of the resources in catalog `<catalog>` are checked with the policies of the given Ranger service instead. The Ranger service of the session catalog `spark_catalog`, and of the catalogs without this config, is still the one configured by `ranger.plugin.spark.service.name`. This feature requires Ranger 2.1 or above.
+
+```xml
+<property>
+    <name>ranger.plugin.spark.catalog.iceberg_catalog.service.name</name>
+    <value>ranger_iceberg</value>
+    <description>Name of the Ranger service containing policies for catalog `iceberg_catalog`.</description>
+</property>
+```
+
 #### ranger-spark-audit.xml
 
 Create `ranger-spark-audit.xml` in `$SPARK_HOME/conf` and add the following configurations
